@@ -1,0 +1,24 @@
+syntax = "proto3";
+package raftpb;
+option go_package = "kvdb/pkb/raftpb";
+
+enum MessageType {
+  VOTE = 0; // 投票请求
+  VOTE_RESP = 1; // 投票响应
+  HEARTBEAT = 2; // 心跳请求
+  HEARTBEAT_RESP = 3; // 心跳响应
+  APPEND_ENTRY = 4; // 附加日志条目请求
+  APPEND_ENTRY_RESP = 5; // 附加日志条目响应
+}
+
+message RaftMessage {
+  MessageType msgType = 1; // 消息类型
+  uint64 term = 2; // 消息的任期号
+  uint64 from = 3; // 消息的发送者
+  uint64 to = 4; // 消息的接收者
+  uint64 lastLogIndex = 5; // 发送者最后一条日志条目的索引
+  uint64 lastLogTerm = 6; // 发送者最后一条日志条目的任期号
+  uint64 lastCommit = 7; // 最后提交的日志条目的索引
+  repeated LogEntry entry = 8; // 日志条目列表
+  bool success = 9; // 请求的执行结果
+}
