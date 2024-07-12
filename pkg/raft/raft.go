@@ -86,12 +86,14 @@ func (r *Raft) BroadcastRequestVote() {
 	r.cluster.Vote(r.id, true)
 
 	r.logger.Infof("%s 发起投票", strconv.FormatUint(r.id, 16))
-
+	//遍历集群中的每个节点（除了自己），并为每个节点发送一个 RequestVote 消息
 	r.cluster.Foreach(func(id uint64, p *ReplicaProgress) {
 		if id == r.id {
 			return
 		}
+		//获取最后一次发送者最后一条日志条目的索引和任期号
 		lastLogIndex, lastLogTerm := r.raftlog.GetLastLogIndexAndTerm()
+		//进行发送消息
 		r.send(&pb.RaftMessage{
 			MsgType:      pb.MessageType_VOTE,
 			Term:         r.currentTerm,
@@ -101,4 +103,69 @@ func (r *Raft) BroadcastRequestVote() {
 			LastLogTerm:  lastLogTerm,
 		})
 	})
+}
+
+// 将数据添加到消息切片，后续在外部读取，发送给其他节点
+func (r *Raft) send(msg *pb.RaftMessage) {
+	r.Msg = append(r.Msg, msg)
+}
+
+func (r *Raft) ReciveRequestVote(mTerm, mCandidateId, mLastLogTerm, mLastLogIndex uint64) (success bool) {
+	// 获取本地节点的最后一条日志的索引和任期号
+	lastLogIndex, lastLogTerm := r.raftlog.GetLastLogIndexAndTerm()
+	// 如果本地节点尚未投票或者已经投票给当前候选人
+	if r.voteFor == 0 || r.voteFor == mCandidateId {
+		// 检查请求投票的候选人的任期号是否大于本地节点的当前任期号
+		// 并且其最后一条日志的任期号和索引都大于或等于本地节点的最后一条日志的任期号和索引
+		if mTerm > r.currentTerm && mLastLogTerm >= lastLogTerm && mLastLogIndex >= lastLogIndex {
+			r.voteFor = mCandidateId
+			success = true
+		}
+	}
+
+	r.logger.Debugf("候选人: %s, 投票: %t ", strconv.FormatUint(mCandidateId, 16), success)
+	// 向请求投票的候选人发送VoteResponse消息
+	// 消息内容包括消息类型、任期号、发送者ID、接收者ID、最后一条日志索引、最后一条日志任期号以及投票结果
+	r.send(&pb.RaftMessage{
+		MsgType:      pb.MessageType_VOTE_RESP,
+		Term:         mTerm,
+		From:         r.id,
+		To:           mCandidateId,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+		Success:      success,
+	})
+	return
+}
+
+// ReciveVoteResp 获取节点投票响应
+func (r *Raft) ReciveVoteResp(from, term, lastLogTerm, lastLogIndex uint64, success bool) {
+	// 获取最后一次的日志的索引
+	leaderLastLogIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+	// 记录发送者ID和投票结果
+	r.cluster.Vote(from, success)
+	//重置 Cluster 结构体中记录的来自特定节点的日志索引，确保所有节点的日志索引与当前领导者的日志索引同步。
+	r.cluster.ResetLogIndex(from, lastLogIndex, leaderLastLogIndex)
+	// 检查投票结果
+	voteRes := r.cluster.CheckVoteResult()
+	// 选举成功
+	if voteRes == VoteWon {
+		r.logger.Debugf("节点 %s 发起投票, 赢得选举", strconv.FormatUint(r.id, 16))
+		// 遍历 Cluster 结构体中的 voteResp 字典，对于那些没有投票给当前节点的节点（其值为 false），通过 ResetLogIndex 方法重置它们的日志索引
+		for k, v := range r.cluster.voteResp {
+			if !v {
+				r.cluster.ResetLogIndex(k, lastLogIndex, leaderLastLogIndex)
+			}
+		}
+		// 自己的角色转换为领导者
+		r.SwitchLeader()
+		// 广播 AppendEntries 消息给集群中的所有其他节点，开始日志复制的过程。
+		r.BroadcastAppendEntries()
+	} else if voteRes == VoteLost { //输掉了选举
+		r.logger.Debugf("节点 %s 发起投票, 输掉选举", strconv.FormatUint(r.id, 16))
+		// 不支持任何特定的候选者
+		r.voteFor = 0
+		// 重置 Cluster 结构体中的投票结果
+		r.cluster.ResetVoteResult()
+	}
 }
