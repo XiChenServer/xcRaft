@@ -169,3 +169,203 @@ func (r *Raft) ReciveVoteResp(from, term, lastLogTerm, lastLogIndex uint64, succ
 		r.cluster.ResetVoteResult()
 	}
 }
+
+// HandleMessage 消息处理
+func (r *Raft) HandleMessage(msg *pb.RaftMessage) {
+	if msg == nil {
+		return
+	}
+
+	// 消息任期小于节点任期,拒绝消息: 1、网络延迟，节点任期是集群任期; 2、网络断开,节点增加了任期，集群任期是消息任期
+	if msg.Term < r.currentTerm {
+		r.logger.Debugf("收到来自 %s 过期 (%d) %s 消息 ", strconv.FormatUint(msg.From, 16), msg.Term, msg.MsgType)
+		return
+	} else if msg.Term > r.currentTerm { // 如果消息的任期大于当前的任期
+		// 消息非请求投票，集群发生选举，新任期产生
+		if msg.MsgType != pb.MessageType_VOTE {
+			// 日志追加、心跳、快照为leader发出，，节点成为该leader追随者
+			if msg.MsgType == pb.MessageType_APPEND_ENTRY || msg.MsgType == pb.MessageType_HEARTBEAT || msg.MsgType == pb.MessageType_INSTALL_SNAPSHOT {
+				r.SwitchFollower(msg.From, msg.Term)
+			} else { // 变更节点为追随者，等待leader消息
+				r.SwitchFollower(msg.From, 0)
+			}
+		}
+	}
+
+	r.hanbleMessage(msg)
+}
+
+// HandleCandidateMessage canidate消息处理
+func (r *Raft) HandleCandidateMessage(msg *pb.RaftMessage) {
+	switch msg.MsgType {
+	//发起投票
+	case pb.MessageType_VOTE:
+		grant := r.ReciveRequestVote(msg.Term, msg.From, msg.LastLogTerm, msg.LastLogIndex)
+		if grant { // 投票后重置选举时间
+			r.electtionTick = 0
+		}
+		//投票回应
+	case pb.MessageType_VOTE_RESP:
+		r.ReciveVoteResp(msg.From, msg.Term, msg.LastLogTerm, msg.LastLogIndex, msg.Success)
+	case pb.MessageType_HEARTBEAT:
+		r.SwitchFollower(msg.From, msg.Term)
+		r.ReciveHeartbeat(msg.From, msg.Term, msg.LastLogIndex, msg.LastCommit, msg.Context)
+	case pb.MessageType_APPEND_ENTRY:
+		r.SwitchFollower(msg.From, msg.Term)
+		r.ReciveAppendEntries(msg.From, msg.Term, msg.LastLogTerm, msg.LastLogIndex, msg.LastCommit, msg.Entry)
+	default:
+		r.logger.Debugf("收到 %s 异常消息 %s 任期 %d", strconv.FormatUint(msg.From, 16), msg.MsgType, msg.Term)
+	}
+}
+
+// ReciveHeartbeat 心跳处理
+func (r *Raft) ReciveHeartbeat(mFrom, mTerm, mLastLogIndex, mLastCommit uint64, context []byte) {
+	lastLogIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+	r.raftlog.Apply(mLastCommit, lastLogIndex)
+
+	r.send(&pb.RaftMessage{
+		MsgType: pb.MessageType_HEARTBEAT_RESP,
+		Term:    r.currentTerm,
+		From:    r.id,
+		To:      mFrom,
+		Context: context,
+	})
+}
+
+// SwitchLeader 切换leader
+func (r *Raft) SwitchLeader() {
+	r.logger.Debugf("成为领导者, 任期: %d", r.currentTerm)
+
+	r.state = LEADER_STATE
+	r.leader = r.id
+	r.voteFor = 0
+	// r.cluster.ResetVoteResult()
+	//更新时钟Tick()为心跳时钟处理方法
+	r.Tick = r.TickHeartbeat
+	//消息处理为leader消息处理方法
+	r.hanbleMessage = r.HandleLeaderMessage
+	r.electtionTick = 0
+	r.hearbeatTick = 0
+	r.cluster.Reset()
+}
+
+// HandleLeaderMessage leader消息处理方法
+func (r *Raft) HandleLeaderMessage(msg *pb.RaftMessage) {
+	switch msg.MsgType {
+	case pb.MessageType_PROPOSE:
+		r.AppendEntry(msg.Entry)
+	case pb.MessageType_VOTE:
+		r.ReciveRequestVote(msg.Term, msg.From, msg.LastLogTerm, msg.LastLogIndex)
+	case pb.MessageType_VOTE_RESP:
+		break
+	case pb.MessageType_HEARTBEAT_RESP:
+		r.ReciveHeartbeatResp(msg.From, msg.Term, msg.LastLogIndex, msg.Context)
+	case pb.MessageType_APPEND_ENTRY_RESP:
+		r.ReciveAppendEntriesResult(msg.From, msg.Term, msg.LastLogIndex, msg.Success)
+	default:
+		r.logger.Debugf("收到 %s 异常消息 %s 任期 %d", strconv.FormatUint(msg.From, 16), msg.MsgType, msg.Term)
+	}
+}
+
+// TickHeartbeat 心跳时钟
+func (r *Raft) TickHeartbeat() {
+	//心跳加一
+	r.hearbeatTick++
+
+	lastIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+	if r.hearbeatTick >= r.heartbeatTimeout {
+		r.hearbeatTick = 0
+		r.BroadcastHeartbeat(nil)
+		r.cluster.Foreach(func(id uint64, p *ReplicaProgress) {
+			if id == r.id {
+				return
+			}
+
+			pendding := len(p.pending)
+			// 重发消息，重发条件：
+			// 上次消息发送未响应且当前有发送未完成,且上次心跳该消息就已处于等待响应状态
+			// 当前无等待响应消息，且节点下次发送日志小于leader最新日志
+			if !p.prevResp && pendding > 0 && p.MaybeLogLost(p.pending[0]) || (pendding == 0 && p.NextIndex <= lastIndex) {
+				p.pending = nil
+				r.SendAppendEntries(id)
+			}
+		})
+	}
+}
+
+// BroadcastHeartbeat 心跳广播
+func (r *Raft) BroadcastHeartbeat(context []byte) {
+	r.cluster.Foreach(func(id uint64, p *ReplicaProgress) {
+		if id == r.id {
+			return
+		}
+		lastLogIndex := p.NextIndex - 1
+		lastLogTerm := r.raftlog.GetTerm(lastLogIndex)
+		r.send(&pb.RaftMessage{
+			MsgType:      pb.MessageType_HEARTBEAT,
+			Term:         r.currentTerm,
+			From:         r.id,
+			To:           id,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+			LastCommit:   r.raftlog.commitIndex,
+			Context:      context,
+		})
+	})
+}
+
+// SwitchFollower 切换follower方法
+func (r *Raft) SwitchFollower(leaderId, term uint64) {
+	//切换状态以及相关的信息
+	r.state = FOLLOWER_STATE
+	r.leader = leaderId
+	r.currentTerm = term
+	// 重置投票，意味着没有进行投票
+	r.voteFor = 0
+	// 设置一个随机的选举超时时间。每个节点的选举超时时间都是随机的，这有助于避免多个节点同时开始新选举的问题。
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.Tick = r.TickElection                   // 从原来的选举超时检查转换为新的选举超时检查函数。
+	r.hanbleMessage = r.HandleFollowerMessage //更改成追随者的角色消息处理函数
+	r.electtionTick = 0                       // 选举超时计数器重置为 0
+	r.cluster.Reset()
+
+	r.logger.Debugf("成为追随者, 领导者 %s, 任期 %d , 选举周期 %d s", strconv.FormatUint(leaderId, 16), term, r.randomElectionTimeout)
+}
+
+// HandleFollowerMessage follower消息处理
+func (r *Raft) HandleFollowerMessage(msg *pb.RaftMessage) {
+	switch msg.MsgType {
+	case pb.MessageType_VOTE:
+		grant := r.ReciveRequestVote(msg.Term, msg.From, msg.LastLogTerm, msg.LastLogIndex)
+		if grant {
+			r.electtionTick = 0
+		}
+	case pb.MessageType_HEARTBEAT:
+		r.electtionTick = 0
+		r.ReciveHeartbeat(msg.From, msg.Term, msg.LastLogIndex, msg.LastCommit, msg.Context)
+	case pb.MessageType_APPEND_ENTRY:
+		r.electtionTick = 0
+		r.ReciveAppendEntries(msg.From, msg.Term, msg.LastLogTerm, msg.LastLogIndex, msg.LastCommit, msg.Entry)
+	default:
+		r.logger.Debugf("收到 %s 异常消息 %s 任期 %d", strconv.FormatUint(msg.From, 16), msg.MsgType, msg.Term)
+	}
+}
+
+// NewRaft 实例化raft
+func NewRaft(id uint64, peers map[uint64]string, logger *zap.SugaredLogger) *Raft {
+	raftlog := NewRaftLog(logger)
+	raft := &Raft{
+		id:               id,
+		currentTerm:      raftlog.lastAppliedTerm,
+		raftlog:          raftlog,
+		cluster:          NewCluster(peers, raftlog.commitIndex, logger),
+		electionTimeout:  10,
+		heartbeatTimeout: 5,
+		logger:           logger,
+	}
+
+	logger.Infof("实例: %s ,任期: %d ", strconv.FormatUint(raft.id, 16), raft.currentTerm)
+	raft.SwitchFollower(0, raft.currentTerm)
+
+	return raft
+}
