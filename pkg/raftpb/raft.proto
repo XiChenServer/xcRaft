@@ -22,3 +22,8 @@ message RaftMessage {
   repeated LogEntry entry = 8; // 日志条目列表
   bool success = 9; // 请求的执行结果
 }
+
+// 节点间通信使用双向流
+service Raft {
+  rpc consensus(stream RaftMessage) returns (stream RaftMessage) {}
+}
