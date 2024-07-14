@@ -27,3 +27,18 @@ message RaftMessage {
 service Raft {
   rpc consensus(stream RaftMessage) returns (stream RaftMessage) {}
 }
+
+// 日志条目
+enum EntryType {
+  NORMAL = 0;
+}
+
+// 日志
+message LogEntry {
+  EntryType type = 1; // 日志类型
+  uint64 term = 2; // 任期
+  uint64 index = 3; // 日志的下标索引
+  bytes data = 4;// 提案的实际内容
+}
+
+
