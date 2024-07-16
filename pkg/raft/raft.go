@@ -105,6 +105,53 @@ func (r *Raft) BroadcastRequestVote() {
 	})
 }
 
+// BroadcastAppendEntries 进行广播追加的日志记录
+func (r *Raft) BroadcastAppendEntries() {
+	r.cluster.Foreach(func(id uint64, _ *ReplicaProgress) {
+		//这里是通过迭代的方式发送的，如果是自己的话，就进行返回
+		if id == r.id {
+			return
+		}
+		r.SendAppendEntries(id)
+	})
+}
+
+// SendAppendEntries 发送追加的日志记录
+func (r *Raft) SendAppendEntries(to uint64) {
+	p := r.cluster.progress[to]
+	if p == nil || p.IsPause() {
+		return
+	}
+
+	nextIndex := r.cluster.GetNextIndex(to)
+	lastLogIndex := nextIndex - 1
+	lastLogTerm := r.raftlog.GetTerm(lastLogIndex)
+	maxSize := MAX_LOG_ENTRY_SEND
+	// 如果上一次发送失败的情况下，最多只能在发送一个了
+	if !p.prevResp {
+		maxSize = 1
+	}
+	// var entries []*pb.LogEntry
+	// 获取日志条目
+	entries := r.raftlog.GetEntries(nextIndex, maxSize)
+	size := len(entries)
+	if size > 0 {
+		//  更新集群中目标节点的进度信息
+		r.cluster.AppendEntry(to, entries[size-1].Index)
+	}
+
+	r.send(&pb.RaftMessage{
+		MsgType:      pb.MessageType_APPEND_ENTRY,
+		Term:         r.currentTerm,
+		From:         r.id,
+		To:           to,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+		LastCommit:   r.raftlog.commitIndex,
+		Entry:        entries,
+	})
+}
+
 // 将数据添加到消息切片，后续在外部读取，发送给其他节点
 func (r *Raft) send(msg *pb.RaftMessage) {
 	r.Msg = append(r.Msg, msg)
@@ -368,4 +415,28 @@ func NewRaft(id uint64, peers map[uint64]string, logger *zap.SugaredLogger) *Raf
 	raft.SwitchFollower(0, raft.currentTerm)
 
 	return raft
+}
+
+// 追加日志的条目
+func (r *Raft) AppendEntry(entries []*pb.LogEntry) {
+	// 从日志中取得最新日志编号，遍历待追加日志，设置日志编号
+	lastLogIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+	for i, entry := range entries {
+		entry.Index = lastLogIndex + 1 + uint64(i)
+		entry.Term = r.currentTerm
+	}
+	// 追加日志到内存切片
+	//更新leader追加进度
+	r.raftlog.AppendEntry(entries)
+	r.cluster.UpdateLogIndex(r.id, entries[len(entries)-1].Index)
+	// 广播日志到集群
+	r.BroadcastAppendEntries()
+}
+
+func (c *Cluster) UpdateLogIndex(id uint64, lastIndex uint64) {
+	p := c.progress[id]
+	if p != nil {
+		p.NextIndex = lastIndex      // 下次发送日志
+		p.MatchIndex = lastIndex + 1 // 已接收日志
+	}
 }

@@ -56,3 +56,12 @@ func (c *Cluster) CheckVoteResult() VoteResult {
 	// 尚在选举
 	return Voting
 }
+
+// GetNextIndex 从节点同步进度中取得当前需发送日志编号
+func (c *Cluster) GetNextIndex(id uint64) uint64 {
+	p := c.progress[id]
+	if p != nil {
+		return p.NextIndex
+	}
+	return 0
+}
