@@ -23,7 +23,7 @@ type RaftNode struct {
 func NewRaftNode(id uint64, peers map[uint64]string, logger *zap.SugaredLogger) *RaftNode {
 
 	node := &RaftNode{
-		raft:   NewRaft(id, peers, logger),
+		raft:   NewRaft(id, storage, peers, logger),
 		recvc:  make(chan *pb.RaftMessage),
 		propc:  make(chan *pb.RaftMessage),
 		sendc:  make(chan []*pb.RaftMessage),
@@ -88,4 +88,12 @@ func (n *RaftNode) Process(ctx context.Context, msg *pb.RaftMessage) error {
 // SendChan 发送数据
 func (n *RaftNode) SendChan() chan []*pb.RaftMessage {
 	return n.sendc
+}
+func (n *RaftNode) Propose(ctx context.Context, entries []*pb.LogEntry) error {
+	msg := &pb.RaftMessage{
+		MsgType: pb.MessageType_PROPOSE,
+		Term:    n.raft.currentTerm,
+		Entry:   entries,
+	}
+	return n.Process(ctx, msg)
 }

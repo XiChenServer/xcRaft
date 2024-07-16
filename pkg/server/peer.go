@@ -149,3 +149,41 @@ func (p *Peer) Recv() {
 		p.recvc <- msg
 	}
 }
+
+func (p *Peer) SendBatch(msgs []*pb.RaftMessage) {
+	p.wg.Add(1)
+	var appEntryMsg *pb.RaftMessage
+	var propMsg *pb.RaftMessage
+	for _, msg := range msgs {
+		if msg.MsgType == pb.MessageType_APPEND_ENTRY {
+			if appEntryMsg == nil {
+				appEntryMsg = msg
+			} else {
+				size := len(appEntryMsg.Entry)
+				if size == 0 || len(msg.Entry) == 0 || appEntryMsg.Entry[size-1].Index+1 == msg.Entry[0].Index {
+					appEntryMsg.LastCommit = msg.LastCommit
+					appEntryMsg.Entry = append(appEntryMsg.Entry, msg.Entry...)
+				} else if appEntryMsg.Entry[0].Index >= msg.Entry[0].Index {
+					appEntryMsg = msg
+				}
+			}
+		} else if msg.MsgType == pb.MessageType_PROPOSE {
+			if propMsg == nil {
+				propMsg = msg
+			} else {
+				propMsg.Entry = append(propMsg.Entry, msg.Entry...)
+			}
+		} else {
+			p.send(msg)
+		}
+	}
+
+	if appEntryMsg != nil {
+		p.send(appEntryMsg)
+	}
+
+	if propMsg != nil {
+		p.send(propMsg)
+	}
+	p.wg.Done()
+}

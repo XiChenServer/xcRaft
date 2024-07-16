@@ -65,3 +65,39 @@ func (c *Cluster) GetNextIndex(id uint64) uint64 {
 	}
 	return 0
 }
+func (c *Cluster) UpdateLogIndex(id uint64, lastIndex uint64) {
+	p := c.progress[id]
+	if p != nil {
+		p.NextIndex = lastIndex      // 下次发送日志
+		p.MatchIndex = lastIndex + 1 // 已接收日志
+	}
+}
+
+func (c *Cluster) AppendEntryResp(id uint64, lastIndex uint64) {
+	p := c.progress[id]
+	if p != nil {
+		p.AppendEntryResp(lastIndex)
+	}
+
+}
+
+// 判断响应对应日志编号是否在集群中大多数节点已同步
+func (c *Cluster) CheckCommit(index uint64) bool {
+	// 集群达到多数共识才允许提交
+	incomingLogged := 0
+	for id := range c.progress {
+		if index <= c.progress[id].MatchIndex {
+			incomingLogged++
+		}
+	}
+	incomingCommit := incomingLogged >= len(c.progress)/2+1
+	return incomingCommit
+}
+
+// ResetLogIndex 重置日志同步进度
+func (c *Cluster) ResetLogIndex(id uint64, lastIndex uint64, leaderLastIndex uint64) {
+	p := c.progress[id]
+	if p != nil {
+		p.ResetLogIndex(lastIndex, leaderLastIndex)
+	}
+}

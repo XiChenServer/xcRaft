@@ -400,7 +400,7 @@ func (r *Raft) HandleFollowerMessage(msg *pb.RaftMessage) {
 
 // NewRaft 实例化raft
 func NewRaft(id uint64, peers map[uint64]string, logger *zap.SugaredLogger) *Raft {
-	raftlog := NewRaftLog(logger)
+	raftlog := NewRaftLog(storage, logger)
 	raft := &Raft{
 		id:               id,
 		currentTerm:      raftlog.lastAppliedTerm,
@@ -433,10 +433,51 @@ func (r *Raft) AppendEntry(entries []*pb.LogEntry) {
 	r.BroadcastAppendEntries()
 }
 
-func (c *Cluster) UpdateLogIndex(id uint64, lastIndex uint64) {
-	p := c.progress[id]
-	if p != nil {
-		p.NextIndex = lastIndex      // 下次发送日志
-		p.MatchIndex = lastIndex + 1 // 已接收日志
+func (r *Raft) ReciveAppendEntries(mLeader, mTerm, mLastLogTerm, mLastLogIndex, mLastCommit uint64, mEntries []*pb.LogEntry) {
+	var accept bool
+	// 检查本地日志是否包含与 leader 发送的 LastLogIndex 和 LastLogTerm 匹配的条目
+	if !r.raftlog.HasPrevLog(mLastLogIndex, mLastLogTerm) { // 检查节点日志是否与leader一致
+		r.logger.Infof("节点未含有上次追加日志: Index: %d, Term: %d ", mLastLogIndex, mLastLogTerm)
+		accept = false
+	} else {
+		r.raftlog.AppendEntry(mEntries)
+		accept = true
+	}
+
+	lastLogIndex, lastLogTerm := r.raftlog.GetLastLogIndexAndTerm()
+	r.raftlog.Apply(mLastCommit, lastLogIndex)
+	r.send(&pb.RaftMessage{
+		MsgType:      pb.MessageType_APPEND_ENTRY_RESP,
+		Term:         r.currentTerm,
+		From:         r.id,
+		To:           mLeader,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+		Success:      accept,
+	})
+}
+
+func (r *Raft) ReciveAppendEntriesResult(from, term, lastLogIndex uint64, success bool) {
+	leaderLastLogIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+	if success {
+		r.cluster.AppendEntryResp(from, lastLogIndex)
+		if lastLogIndex > r.raftlog.commitIndex {
+			// 取已同步索引更新到lastcommit
+			if r.cluster.CheckCommit(lastLogIndex) {
+				prevApplied := r.raftlog.lastAppliedIndex
+				r.raftlog.Apply(lastLogIndex, lastLogIndex)
+				r.BroadcastAppendEntries()
+			}
+		} else if len(r.raftlog.waitQueue) > 0 {
+			r.raftlog.NotifyReadIndex()
+		}
+		if r.cluster.GetNextIndex(from) <= leaderLastLogIndex {
+			r.SendAppendEntries(from)
+		}
+	} else {
+		r.logger.Infof("节点 %s 追加日志失败, Leader记录节点最新日志: %d ,节点最新日志: %d ", strconv.FormatUint(from, 16), r.cluster.GetNextIndex(from)-1, lastLogIndex)
+
+		r.cluster.ResetLogIndex(from, lastLogIndex, leaderLastLogIndex)
+		r.SendAppendEntries(from)
 	}
 }

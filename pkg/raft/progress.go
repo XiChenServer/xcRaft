@@ -20,3 +20,45 @@ func (rp *ReplicaProgress) AppendEntry(lastIndex uint64) {
 		rp.NextIndex = lastIndex + 1
 	}
 }
+
+func (rp *ReplicaProgress) AppendEntryResp(lastIndex uint64) {
+
+	if rp.MatchIndex < lastIndex {
+		rp.MatchIndex = lastIndex
+	}
+
+	idx := -1
+	for i, v := range rp.pending {
+		if v == lastIndex {
+			idx = i
+		}
+	}
+
+	// 标记前次日志发送成功，更新下次发送
+	if !rp.prevResp {
+		rp.prevResp = true
+		rp.NextIndex = lastIndex + 1
+	}
+
+	if idx > -1 {
+		// 清除之前发送
+		rp.pending = rp.pending[idx+1:]
+	}
+}
+
+func (rp *ReplicaProgress) ResetLogIndex(lastLogIndex uint64, leaderLastLogIndex uint64) {
+
+	// 节点最后日志小于leader最新日志按节点更新进度，否则按leader更新进度
+	if lastLogIndex < leaderLastLogIndex {
+		rp.NextIndex = lastLogIndex + 1
+		rp.MatchIndex = lastLogIndex
+	} else {
+		rp.NextIndex = leaderLastLogIndex + 1
+		rp.MatchIndex = leaderLastLogIndex
+	}
+
+	if rp.prevResp {
+		rp.prevResp = false
+		rp.pending = nil
+	}
+}
