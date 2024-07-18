@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path"
 	"strconv"
 	"xcRaft/pkg/raft"
 )
@@ -148,7 +149,8 @@ func GenerateNodeId(name string) uint64 {
 }
 
 func Bootstrap(conf *Config) *RaftServer {
-
+	dir := path.Join(conf.Dir, conf.Name)
+	storage := raft.NewRaftStorage(dir, &raft.SimpleEncoding{}, conf.Logger)
 	var nodeId uint64
 	var node *raft.RaftNode
 	servers := make(map[uint64]*Peer, len(conf.Peers))
@@ -188,6 +190,7 @@ func Bootstrap(conf *Config) *RaftServer {
 		peers:       servers,
 		node:        node,
 		stopc:       make(chan struct{}),
+		storage:     storage,
 	}
 
 	return server

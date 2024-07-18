@@ -122,6 +122,22 @@ func (r *Raft) SendAppendEntries(to uint64) {
 	if p == nil || p.IsPause() {
 		return
 	}
+	entries := r.raftlog.GetEntries(nextIndex, maxSize)
+	size := len(entries)
+	if size == 0 {
+		if nextIndex <= r.raftlog.lastAppliedIndex && p.prevResp {
+			snapc, err := r.raftlog.GetSnapshot(nextIndex)
+			if err != nil {
+				r.logger.Errorf("获取快照失败: %v", err)
+				return
+			}
+			r.cluster.InstallSnapshot(to, snapc)
+			r.sendSnapshot(to, true)
+			return
+		}
+	} else {
+		r.cluster.AppendEntry(to, entries[size-1].Index)
+	}
 
 	nextIndex := r.cluster.GetNextIndex(to)
 	lastLogIndex := nextIndex - 1
@@ -150,6 +166,13 @@ func (r *Raft) SendAppendEntries(to uint64) {
 		LastCommit:   r.raftlog.commitIndex,
 		Entry:        entries,
 	})
+}
+func (rp *ReplicaProgress) IsPause() bool {
+	return rp.installingSnapshot || (!rp.prevResp && len(rp.pending) > 0)
+}
+
+func (l *RaftLog) GetSnapshot(index uint64) (chan *pb.Snapshot, error) {
+	return l.storage.GetSnapshot(index)
 }
 
 // 将数据添加到消息切片，后续在外部读取，发送给其他节点
@@ -324,20 +347,15 @@ func (r *Raft) TickHeartbeat() {
 		r.hearbeatTick = 0
 		r.BroadcastHeartbeat(nil)
 		r.cluster.Foreach(func(id uint64, p *ReplicaProgress) {
-			if id == r.id {
-				return
-			}
-
-			pendding := len(p.pending)
-			// 重发消息，重发条件：
-			// 上次消息发送未响应且当前有发送未完成,且上次心跳该消息就已处于等待响应状态
-			// 当前无等待响应消息，且节点下次发送日志小于leader最新日志
-			if !p.prevResp && pendding > 0 && p.MaybeLogLost(p.pending[0]) || (pendding == 0 && p.NextIndex <= lastIndex) {
-				p.pending = nil
-				r.SendAppendEntries(id)
+			...
+			// 重发快照,条件：上次快照在两次心跳内未发送完成
+			if p.installingSnapshot && p.prevSnap != nil && p.MaybeSnapLost(p.prevSnap) {
+				r.logger.Debugf("重发 %d_%s@%d_%d 偏移 %d", p.prevSnap.Level, strconv.FormatUint(p.prevSnap.LastIncludeIndex, 16), p.prevSnap.LastIncludeTerm, p.prevSnap.Segment, p.prevSnap.Offset)
+				r.sendSnapshot(id, false)
 			}
 		})
 	}
+
 }
 
 // BroadcastHeartbeat 心跳广播
@@ -387,16 +405,31 @@ func (r *Raft) HandleFollowerMessage(msg *pb.RaftMessage) {
 		if grant {
 			r.electtionTick = 0
 		}
+
+	case pb.MessageType_INSTALL_SNAPSHOT:
+		r.ReciveInstallSnapshot(msg.From, msg.Term, msg.Snapshot)
 	case pb.MessageType_HEARTBEAT:
 		r.electtionTick = 0
 		r.ReciveHeartbeat(msg.From, msg.Term, msg.LastLogIndex, msg.LastCommit, msg.Context)
 	case pb.MessageType_APPEND_ENTRY:
 		r.electtionTick = 0
 		r.ReciveAppendEntries(msg.From, msg.Term, msg.LastLogTerm, msg.LastLogIndex, msg.LastCommit, msg.Entry)
+	case pb.MessageType_INSTALL_SNAPSHOT_RESP:
+		r.ReciveInstallSnapshotResult(msg.From, msg.Term, msg.LastLogIndex, msg.Success)
 	default:
 		r.logger.Debugf("收到 %s 异常消息 %s 任期 %d", strconv.FormatUint(msg.From, 16), msg.MsgType, msg.Term)
 	}
 }
+func (r *Raft) ReciveInstallSnapshotResult(from, term, lastLogIndex uint64, installed bool) {
+	if installed {
+		leaderLastLogIndex, _ := r.raftlog.GetLastLogIndexAndTerm()
+		r.cluster.ResetLogIndex(from, lastLogIndex, leaderLastLogIndex)
+		r.logger.Debugf("%s 快照更新 ,当前最后日志 %d ", strconv.FormatUint(from, 16), lastLogIndex)
+	}
+	r.sendSnapshot(from, true)
+
+}
+
 
 // NewRaft 实例化raft
 func NewRaft(id uint64, peers map[uint64]string, logger *zap.SugaredLogger) *Raft {
@@ -479,5 +512,86 @@ func (r *Raft) ReciveAppendEntriesResult(from, term, lastLogIndex uint64, succes
 
 		r.cluster.ResetLogIndex(from, lastLogIndex, leaderLastLogIndex)
 		r.SendAppendEntries(from)
+	}
+}
+
+func (r *Raft) sendSnapshot(to uint64, prevSuccess bool) {
+	snap := r.cluster.GetSnapshot(to, prevSuccess)
+	if snap == nil {
+		r.SendAppendEntries(to)
+		return
+	}
+	msg := &pb.RaftMessage{
+		MsgType:  pb.MessageType_INSTALL_SNAPSHOT,
+		Term:     r.currentTerm,
+		From:     r.id,
+		To:       to,
+		Snapshot: snap,
+	}
+	r.Msg = append(r.Msg, msg)
+}
+
+func (c *Cluster) GetSnapshot(id uint64, prevSuccess bool) *pb.Snapshot {
+	p := c.progress[id]
+	if p != nil {
+		return p.GetSnapshot(prevSuccess)
+	} else {
+		c.logger.Debugf("%s 未初始化完成，无法发送快照", strconv.FormatUint(id, 16))
+	}
+	return nil
+}
+
+func (rp *ReplicaProgress) GetSnapshot(prevSuccess bool) *pb.Snapshot {
+	if !prevSuccess {
+		return rp.prevSnap
+	}
+
+	if rp.snapc == nil {
+		return nil
+	}
+	snap := <-rp.snapc
+	if snap == nil {
+		rp.snapc = nil
+		rp.installingSnapshot = false
+	}
+	rp.prevSnap = snap
+	return snap
+}
+func (r *Raft) ReciveInstallSnapshot(from, term uint64, snap *pb.Snapshot) {
+	var installed bool
+	if snap.LastIncludeIndex > r.raftlog.lastAppliedIndex {
+		installed, _ = r.raftlog.InstallSnapshot(snap)
+	}
+
+	lastLogIndex, lastLogTerm := r.raftlog.GetLastLogIndexAndTerm()
+	r.send(&pb.RaftMessage{
+		MsgType:      pb.MessageType_INSTALL_SNAPSHOT_RESP,
+		Term:         r.currentTerm,
+		From:         r.id,
+		To:           from,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+		Success:      installed,
+	})
+}
+
+func (l *RaftLog) InstallSnapshot(snap *pb.Snapshot) (bool, error) {
+	// 当前日志未提交,强制提交并更新快照
+	if len(l.logEnties) > 0 {
+		l.Apply(l.lastAppendIndex, l.lastAppendIndex)
+	}
+	// 添加快照到存储
+	added, err := l.storage.InstallSnapshot(snap)
+	if added { // 添加完成,更新最后提交
+		l.ReloadSnapshot()
+	}
+	return added, err
+}
+
+func (l *RaftLog) ReloadSnapshot() {
+	lastIndex, lastTerm := l.storage.GetLastLogIndexAndTerm()
+	if lastIndex > l.lastAppliedIndex {
+		l.lastAppliedIndex = lastIndex
+		l.lastAppliedTerm = lastTerm
 	}
 }

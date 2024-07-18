@@ -9,7 +9,23 @@ enum MessageType {
   HEARTBEAT_RESP = 3; // 心跳响应
   APPEND_ENTRY = 4; // 附加日志条目请求
   APPEND_ENTRY_RESP = 5; // 附加日志条目响应
+
+  INSTALL_SNAPSHOT = 8;
+  INSTALL_SNAPSHOT_RESP = 9;
 }
+
+
+message Snapshot {
+  uint64 lastIncludeIndex = 1;
+  uint64 lastIncludeTerm = 2;
+  uint32 level = 3;
+  uint32 segment = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool done = 7;
+}
+
+
 
 message RaftMessage {
   MessageType msgType = 1; // 消息类型
@@ -21,6 +37,7 @@ message RaftMessage {
   uint64 lastCommit = 7; // 最后提交的日志条目的索引
   repeated LogEntry entry = 8; // 日志条目列表
   bool success = 9; // 请求的执行结果
+  Snapshot snapshot = 10;
 }
 
 // 节点间通信使用双向流
